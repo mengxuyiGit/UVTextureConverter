@@ -98,9 +98,11 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
     verts, faces, aux = load_obj(obj_path, load_textures=False)
     verts = verts.to(device)
     faces_idx = faces.verts_idx.to(device)
+    
+    _, faces, aux = load_obj("smplx_uv.obj", load_textures=False)
     verts_uvs = aux.verts_uvs.numpy()
     faces_uvs = faces.textures_idx.numpy()
-    
+
     texture_path = "smplx_uv_altas_colored_i_no_flip.png"
     texture_image = cv2.imread(texture_path)[:, :, ::-1]  # BGR to RGB
 
@@ -139,16 +141,17 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
                                 shader_mode=shader_mode,
                                 )
     return image
-    
 
+obj_path = "smplx_uv.obj"
+obj_path = "/home/liu-compute/Downloads/CatDensepose/smplx_params/0000/mesh_smplx.obj"
 
-image = render_safe_vertex_albedo("smplx_uv.obj", image_size=256, device="cuda")
+image = render_safe_vertex_albedo(obj_path, image_size=256, device="cuda")
 print("image:", image.shape, image[...,0].min(), image[...,0].max())
 
 image = (image * 255).astype(np.uint8)
 print("image 255 unique values", np.unique(image))
 # Save the image
-output_path = "texture_only_p3d.png"
+output_path = "texture_only_p3d_posed_smplx.png"
 cv2.imwrite(output_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 print(f"Saved: {output_path}")
 
