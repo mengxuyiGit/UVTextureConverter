@@ -12,6 +12,7 @@ from pytorch3d.renderer import (
 )
 import cv2
 import numpy as np
+import einops
 
 
 from pytorch3d.renderer import (
@@ -36,15 +37,84 @@ class TextureOnlyShader(ShaderBase):
         
         return texture
 
+import numpy as np
+
+def generate_orbit_cameras(num_views=8, pos=[-1, 0, 1], dist=3.2, radius=0.55):
+    """
+    Args:
+        num_views (int): Number of views per elevation layer.
+        pos (list): List of elevation shifts [-1, 0, 1] typically.
+        dist (float): Distance from camera to origin center.
+        radius (float): Radius to control focal length.
+        
+    Returns:
+        Rs: (N, 3, 3) torch-compatible rotation matrices
+        Ts: (N, 3) torch-compatible translation vectors
+    """
+    all_R = []
+    all_T = []
+
+    for p in pos:
+        for k in range(num_views):
+            # Horizontal orbit (azimuthal)
+            y0 = k * np.pi / num_views
+            sy = np.sin(y0)
+            cy = np.cos(y0)
+            R_C_y = np.array([
+                [ cy, 0.0,  sy],
+                [0.0, 1.0, 0.0],
+                [-sy, 0.0, cy]
+            ], dtype=np.float32)
+
+            # Vertical tilt (here fixed at 0 elevation)
+            x0 = 0.0
+            sx = np.sin(x0)
+            cx = np.cos(x0)
+            R_C_x = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, cx, -sx],
+                [0.0, sx,  cx]
+            ], dtype=np.float32)
+
+            # Camera location
+            loc = np.array([0, p, dist], dtype=np.float32)
+            loc = (R_C_x @ R_C_y).T @ loc
+
+            # Target always (0, p, 0)
+            # Not directly used here, but blender uses it for look-at
+
+            # Camera extrinsics (world-to-camera)
+            R = R_C_x @ R_C_y
+            T = -R @ loc
+
+            # Blender to OpenCV convention flip
+            Flip = np.diag([1, -1, -1]).astype(np.float32)
+            R = Flip @ R
+            T = Flip @ T
+
+            all_R.append(R)
+            all_T.append(T)
+
+    all_R = np.stack(all_R, axis=0)  # (N, 3, 3)
+    all_T = np.stack(all_T, axis=0)  # (N, 3)
+
+    return all_R, all_T
+
+
 def render_configurable(
     mesh,
     image_size=512,
     device="cuda",
     shader_mode="original",  # options: "original", "albedo_only", "texture_only"
     background_color=(1.0, 1.0, 1.0),  # add this
+    num_cameras=8,
+    dist=2.5,
 ):
-    # === 1. Camera: fixed view
-    R, T = look_at_view_transform(dist=2.5, elev=0, azim=0)
+    # === 1. Camera: multi view, fixed elev=0
+    azim = np.linspace(0, 360, num_cameras, endpoint=False)  # (0, 45, 90, ..., 315)
+    azim = torch.from_numpy(azim).float()
+    elev = torch.zeros_like(azim)  # (8,) all zeros
+    R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)
     cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
 
     # === 2. Rasterizer
@@ -88,7 +158,8 @@ def render_configurable(
     print("images:", images.shape)
     if shader_mode == "texture_only":
         # For texture-only shader, we need to remove the alpha channel
-        return images[0, ..., 0, :3].cpu().numpy()
+        images = einops.rearrange(images, "b h w a c -> h (b w) a c")
+        return images[..., 0, :3].cpu().numpy()
     elif shader_mode == "original":
         return images[0,..., :3].cpu().numpy()
 
@@ -122,7 +193,19 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
     # Load texture image
     texture_image = texture_image.astype(np.float32) / 255.0
     texture_tensor = torch.from_numpy(texture_image).unsqueeze(0).to(device)  # (1, 3, H, W)
-    # print("texture_tensor:", texture_tensor.shape)
+    
+
+
+    num_views = 16
+    verts_list = [verts]*num_views
+    faces_idx_list = [faces_idx]*num_views
+    verts_uvs = verts_uvs.repeat(num_views, 1, 1)  # (24, Vt, 2)
+    faces_uvs = faces_uvs.repeat(num_views, 1, 1)  # (24, F, 3)
+    texture_tensor = texture_tensor.repeat(num_views, 1, 1, 1)  # (24, 3, H, W)
+    
+    
+    
+    print("texture_tensor:", texture_tensor.shape)
     
     textures = TexturesUV(
         maps=texture_tensor,
@@ -130,7 +213,7 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
         verts_uvs=verts_uvs,
         sampling_mode="nearest",  # "bilinear" or "nearest"
     )
-    mesh = Meshes(verts=[verts], faces=[faces_idx], textures=textures)
+    mesh = Meshes(verts=verts_list, faces=faces_idx_list, textures=textures)
     
         
     shader_mode="texture_only"
@@ -139,6 +222,7 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
     
     image = render_configurable(mesh, image_size=512, device="cuda", 
                                 shader_mode=shader_mode,
+                                num_cameras=num_views, dist=1.5,
                                 )
     return image
 
