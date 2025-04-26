@@ -88,7 +88,7 @@ def generate_orbit_cameras(num_views=8, pos=[-1, 0, 1], dist=3.2, radius=0.55):
             T = -R @ loc
 
             # Blender to OpenCV convention flip
-            Flip = np.diag([1, -1, -1]).astype(np.float32)
+            Flip = np.diag([-1, 1, -1]).astype(np.float32)
             R = Flip @ R
             T = Flip @ T
 
@@ -101,6 +101,98 @@ def generate_orbit_cameras(num_views=8, pos=[-1, 0, 1], dist=3.2, radius=0.55):
     return all_R, all_T
 
 
+import numpy as np
+import torch
+from pytorch3d.renderer import PerspectiveCameras
+
+def generate_orbit_cameras_with_intrinsics(
+    num_views=8,
+    pos=[-1, 0, 1],
+    dist=3.2,
+    radius=0.55,
+    img_size=(2048, 1500),  # (width, height)
+):
+    """
+    Args:
+        num_views (int): Number of views per elevation layer.
+        pos (list): List of elevation shifts [-1, 0, 1] typically.
+        dist (float): Distance from camera to origin center.
+        radius (float): Radius to control focal length.
+        img_size (tuple): (width, height) of rendered image.
+        
+    Returns:
+        cameras: PerspectiveCameras ready to use
+    """
+    all_R = []
+    all_T = []
+    all_focal = []
+    all_principal = []
+
+    img_w, img_h = img_size
+
+    for p in pos:
+        for k in range(num_views):
+            # Horizontal orbit (azimuthal)
+            y0 = k * np.pi / num_views
+            sy = np.sin(y0)
+            cy = np.cos(y0)
+            R_C_y = np.array([
+                [ cy, 0.0,  sy],
+                [0.0, 1.0, 0.0],
+                [-sy, 0.0, cy]
+            ], dtype=np.float32)
+
+            # Vertical tilt (fixed at 0 elevation)
+            x0 = 0.0
+            sx = np.sin(x0)
+            cx = np.cos(x0)
+            R_C_x = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, cx, -sx],
+                [0.0, sx,  cx]
+            ], dtype=np.float32)
+
+            # Camera location
+            loc = np.array([0, p, dist], dtype=np.float32)
+            loc = (R_C_x @ R_C_y).T @ loc
+
+            # Camera extrinsics (world-to-camera)
+            R = R_C_x @ R_C_y
+            T = -R @ loc
+
+            # Flip to OpenGL/Blender convention
+            Flip = np.diag([-1, 1, -1]).astype(np.float32)
+            R = Flip @ R
+            T = Flip @ T
+
+            all_R.append(R)
+            all_T.append(T)
+
+            # Compute focal length and principal point
+            lens = 12 * np.linalg.norm(loc) / radius  # Same as Blender
+            fx = fy = lens / 24 * img_h
+            cx = img_w / 2
+            cy = img_h / 2
+
+            # Normalize to NDC space
+            fx_norm = fx / (img_w / 2)
+            fy_norm = fy / (img_h / 2)
+            px_norm = (cx - img_w/2) / (img_w/2)  # 0
+            py_norm = (cy - img_h/2) / (img_h/2)  # 0
+
+            all_focal.append([fx_norm, fy_norm])
+            all_principal.append([px_norm, py_norm])
+
+    # Stack all
+    R = torch.from_numpy(np.stack(all_R, axis=0)).float()  # (N, 3, 3)
+    T = torch.from_numpy(np.stack(all_T, axis=0)).float()  # (N, 3)
+    focal = torch.tensor(all_focal).float()                # (N, 2)
+    principal = torch.tensor(all_principal).float()        # (N, 2)
+
+    return R, T, focal, principal
+
+
+
 def render_configurable(
     mesh,
     image_size=512,
@@ -111,13 +203,40 @@ def render_configurable(
     dist=2.5,
 ):
     # === 1. Camera: multi view, fixed elev=0
-    azim = np.linspace(0, 360, num_cameras, endpoint=False)  # (0, 45, 90, ..., 315)
-    azim = torch.from_numpy(azim).float()
-    elev = torch.zeros_like(azim)  # (8,) all zeros
-    R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)
-    cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+    camera_sample_mode = "custom_with_intrinsics"
+    if camera_sample_mode == "pytorch3d":
+        azim = np.linspace(0, 360, num_cameras, endpoint=False)  # (0, 45, 90, ..., 315)
+        azim = torch.from_numpy(azim).float()
+        elev = torch.zeros_like(azim)  # (8,) all zeros
+        R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+    elif camera_sample_mode == "custom":
+        R_np, T_np = generate_orbit_cameras(num_views=num_cameras, pos=[0], dist=dist)
+        # print("R v.s. R_np \n", R, "\n", R_np)
+        # print("T v.s. T_np \n", T, "\n", T_np) 
+        R = torch.from_numpy(R_np).to(device)
+        T = torch.from_numpy(T_np).to(device)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+    elif camera_sample_mode == "custom_with_intrinsics":
+        R, T, focal, principal = generate_orbit_cameras_with_intrinsics(
+            num_views=num_cameras,
+            pos=[0],
+            dist=dist,
+            img_size=image_size,
+        )
+
+        cameras = PerspectiveCameras(
+            device=device,
+            R=R.to(device),
+            T=T.to(device),
+            focal_length=focal.to(device),
+            principal_point=principal.to(device),
+            in_ndc=True,
+        )
+
 
     # === 2. Rasterizer
+    print("image size to render:", image_size)
     raster_settings = RasterizationSettings(
         image_size=image_size,
         blur_radius=0.0,
@@ -196,7 +315,7 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
     
 
 
-    num_views = 16
+    num_views = 1
     verts_list = [verts]*num_views
     faces_idx_list = [faces_idx]*num_views
     verts_uvs = verts_uvs.repeat(num_views, 1, 1)  # (24, Vt, 2)
@@ -220,16 +339,16 @@ def render_safe_vertex_albedo(obj_path, image_size=256, device="cuda"):
     # shader_mode="albedo_only"
     # shader_mode="original"
     
-    image = render_configurable(mesh, image_size=512, device="cuda", 
+    image = render_configurable(mesh, image_size=image_size, device="cuda", 
                                 shader_mode=shader_mode,
-                                num_cameras=num_views, dist=1.5,
+                                num_cameras=num_views, dist=1.0,
                                 )
     return image
 
 obj_path = "smplx_uv.obj"
 obj_path = "/home/liu-compute/Downloads/CatDensepose/smplx_params/0000/mesh_smplx.obj"
 
-image = render_safe_vertex_albedo(obj_path, image_size=256, device="cuda")
+image = render_safe_vertex_albedo(obj_path, image_size=(2048, 1500), device="cuda")
 print("image:", image.shape, image[...,0].min(), image[...,0].max())
 
 image = (image * 255).astype(np.uint8)
@@ -239,8 +358,13 @@ output_path = "texture_only_p3d_posed_smplx.png"
 cv2.imwrite(output_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 print(f"Saved: {output_path}")
 
-# import matplotlib.pyplot as plt
-# plt.imshow(image)
-# plt.axis("off")
-# plt.title("Vertex Color Albedo (Red)")
-# plt.show()
+
+## check alignment by overlay with the RGB renderings
+import glob
+from PIL import Image
+image_folder = "/home/liu-compute/Repo/UVTextureConverter/test_data/0000"
+images_paths = sorted(glob.glob(f"{image_folder}/*.png"))
+im1 = Image.open(images_paths[0])
+im2 = Image.open(output_path)
+im_overlay = Image.blend(im1, im2, alpha=0.5)
+im_overlay.save("texture_overlay.png")
